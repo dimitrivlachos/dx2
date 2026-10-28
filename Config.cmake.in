@@ -1,3 +1,19 @@
 @PACKAGE_INIT@
 
-include ( "${CMAKE_CURRENT_LIST_DIR}/DX2Targets.cmake" )
+include(CMakeFindDependencyMacro)
+
+find_dependency(HDF5)
+find_dependency(gemmi CONFIG)
+find_dependency(nlohmann_json 3.11.3)
+find_dependency(fmt 11.0)
+find_dependency(Eigen3)
+find_dependency(mdspan)
+
+# Link-only dependencies carried by a static dx2.
+find_dependency(PkgConfig)
+pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+if(@zstd_FOUND@)
+    find_dependency(zstd CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/DX2Targets.cmake")
