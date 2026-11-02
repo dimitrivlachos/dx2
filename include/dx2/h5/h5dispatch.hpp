@@ -1,13 +1,17 @@
 /**
  * @file h5dispatch.hpp
- * @brief Supported column types and their HDF5 mappings.
+ * @brief Supported column and pixel types and their HDF5 mappings.
  *
  * This header provides:
  * - ColumnTypes, the single list of C++ types a reflection table column
  *   can hold, and the compile-time helpers generated from it.
  * - H5TypeTraits, the HDF5 description of each type, and make_h5_type,
  *   which creates a datatype owned by the caller.
- * - dispatch_h5_dataset_type, which maps an HDF5 dataset to a column type.
+ * - dispatch_h5_dataset_type, which maps an HDF5 dataset to a type in a
+ *   type_list, ColumnTypes by default.
+ *
+ * The image types in dx2/image/pixel_type.hpp reuse H5TypeTraits and the
+ * dispatch over their own list.
  */
 
 #pragma once
@@ -105,6 +109,42 @@ template <> struct H5TypeTraits<double> {
   static H5Type make() { return H5Type(H5Tcopy(H5T_NATIVE_DOUBLE)); }
 };
 
+template <> struct H5TypeTraits<uint8_t> {
+  static constexpr H5T_class_t h5_class = H5T_INTEGER;
+  static constexpr H5T_sign_t h5_sign = H5T_SGN_NONE;
+  static H5Type make() { return H5Type(H5Tcopy(H5T_NATIVE_UINT8)); }
+};
+
+template <> struct H5TypeTraits<uint16_t> {
+  static constexpr H5T_class_t h5_class = H5T_INTEGER;
+  static constexpr H5T_sign_t h5_sign = H5T_SGN_NONE;
+  static H5Type make() { return H5Type(H5Tcopy(H5T_NATIVE_UINT16)); }
+};
+
+template <> struct H5TypeTraits<uint32_t> {
+  static constexpr H5T_class_t h5_class = H5T_INTEGER;
+  static constexpr H5T_sign_t h5_sign = H5T_SGN_NONE;
+  static H5Type make() { return H5Type(H5Tcopy(H5T_NATIVE_UINT32)); }
+};
+
+template <> struct H5TypeTraits<int8_t> {
+  static constexpr H5T_class_t h5_class = H5T_INTEGER;
+  static constexpr H5T_sign_t h5_sign = H5T_SGN_2;
+  static H5Type make() { return H5Type(H5Tcopy(H5T_NATIVE_INT8)); }
+};
+
+template <> struct H5TypeTraits<int16_t> {
+  static constexpr H5T_class_t h5_class = H5T_INTEGER;
+  static constexpr H5T_sign_t h5_sign = H5T_SGN_2;
+  static H5Type make() { return H5Type(H5Tcopy(H5T_NATIVE_INT16)); }
+};
+
+template <> struct H5TypeTraits<float> {
+  static constexpr H5T_class_t h5_class = H5T_FLOAT;
+  static constexpr H5T_sign_t h5_sign = H5T_SGN_ERROR;
+  static H5Type make() { return H5Type(H5Tcopy(H5T_NATIVE_FLOAT)); }
+};
+
 /// A uint8 enum rather than H5T_NATIVE_HBOOL, which bit-packs.
 template <> struct H5TypeTraits<BoolEnum> {
   static constexpr H5T_class_t h5_class = H5T_ENUM;
@@ -151,16 +191,17 @@ bool any_of_types(type_list<Ts...>, F &&f) {
  * @brief Dispatch based on the type of an HDF5 dataset.
  *
  * Matches the dataset's HDF5 class, size and (for integers) sign against
- * H5TypeTraits for each entry in ColumnTypes, and invokes the callback
- * with the first matching type tag.
+ * H5TypeTraits for each entry in List, and invokes the callback with the
+ * first matching type tag.
  *
+ * @tparam List The type_list to match against; ColumnTypes by default.
  * @tparam Callback A callable with templated operator()(type_tag<T>).
  * @param dataset_id The HDF5 dataset to inspect.
  * @param cb The callback to invoke with the matched type tag.
  *
- * @throws std::runtime_error if no column type matches.
+ * @throws std::runtime_error if no type in List matches.
  */
-template <typename Callback>
+template <typename List = ColumnTypes, typename Callback>
 void dispatch_h5_dataset_type(hid_t dataset_id, Callback &&cb) {
   H5Type type_id(H5Dget_type(dataset_id));
   if (!type_id) {
@@ -171,7 +212,7 @@ void dispatch_h5_dataset_type(hid_t dataset_id, Callback &&cb) {
   size_t size = H5Tget_size(type_id);
   H5T_sign_t sign = H5Tget_sign(type_id);
 
-  bool matched = any_of_types(ColumnTypes{}, [&](auto tag) {
+  bool matched = any_of_types(List{}, [&](auto tag) {
     using T = typename decltype(tag)::type;
     using Traits = H5TypeTraits<T>;
     if (Traits::h5_class != cls || sizeof(T) != size ||
@@ -189,7 +230,7 @@ void dispatch_h5_dataset_type(hid_t dataset_id, Callback &&cb) {
                "  • Size : {}\n"
                "  • Sign : {}\n",
                static_cast<int>(cls), size, static_cast<int>(sign));
-    throw std::runtime_error("No matching column type.");
+    throw std::runtime_error("No matching type in the dispatch list.");
   }
 }
 
