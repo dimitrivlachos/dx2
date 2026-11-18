@@ -1,0 +1,352 @@
+#include <atomic>
+#include <chrono>
+#include <dx2/h5/h5utils.hpp>
+#include <dx2/image/chunk_decoder.hpp>
+#include <dx2/image/h5_image_source.hpp>
+#include <filesystem>
+#include <gtest/gtest.h>
+#include <hdf5.h>
+#include <numeric>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+using dx2::ChunkDecoder;
+using dx2::Compression;
+using dx2::Frame;
+using dx2::FrameShape;
+using dx2::H5ImageSource;
+using dx2::PixelType;
+using dx2::RawChunk;
+
+namespace {
+
+constexpr size_t SLOW = 32;
+constexpr size_t FAST = 48;
+constexpr size_t NUM_FRAMES = 3;
+
+/// A per-process scratch directory; files are removed with it.
+std::filesystem::path scratch_dir() {
+  static const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() /
+      ("dx2_h5_image_source_" + std::to_string(getpid()));
+  std::filesystem::create_directories(dir);
+  return dir;
+}
+
+// Deterministic pixel values that differ between frames and across the
+// frame, small enough for every pixel type under test.
+template <typename T> std::vector<T> expected_pixels(size_t frame) {
+  std::vector<T> pixels(SLOW * FAST);
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i] = static_cast<T>((frame * 131 + i * 7) % 251);
+  }
+  return pixels;
+}
+
+struct Fixture {
+  std::filesystem::path path;
+  std::string dataset = "/entry/data/data";
+};
+
+// Writes a {NUM_FRAMES, SLOW, FAST} dataset with the filter declared as a
+// writer declares it, chunks encoded by dx2 and stored with
+// H5Dwrite_chunk. Only the first written_frames chunks exist. With
+// chunked false the dataset is contiguous and written through H5Dwrite.
+template <typename T>
+Fixture write_fixture(const std::string &name, Compression compression,
+                      size_t written_frames = NUM_FRAMES, bool chunked = true) {
+  Fixture fixture{scratch_dir() / (name + ".h5")};
+  h5utils::H5File file(
+      H5Fcreate(fixture.path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Group entry(
+      H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Group data(
+      H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+
+  const hsize_t dims[3] = {NUM_FRAMES, SLOW, FAST};
+  h5utils::H5Plist dcpl(H5Pcreate(H5P_DATASET_CREATE));
+  if (chunked) {
+    const hsize_t chunk[3] = {1, SLOW, FAST};
+    H5Pset_chunk(dcpl, 3, chunk);
+    if (compression == Compression::BitshuffleLZ4) {
+      const unsigned user_values[2] = {0, 2};
+      H5Pset_filter(dcpl, dx2::bitshuffle_filter_id, H5Z_FLAG_OPTIONAL, 2,
+                    user_values);
+    }
+  }
+  h5utils::H5Space space(H5Screate_simple(3, dims, nullptr));
+  h5utils::H5Type type = h5dispatch::H5TypeTraits<T>::make();
+  h5utils::H5Dataset dataset(
+      H5Dcreate2(data, "data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT));
+
+  for (size_t frame = 0; frame < written_frames; ++frame) {
+    const auto pixels = expected_pixels<T>(frame);
+    const hsize_t offset[3] = {frame, 0, 0};
+    if (chunked) {
+      const auto chunk = dx2::encode_chunk(std::as_bytes(std::span(pixels)),
+                                           compression, sizeof(T));
+      H5Dwrite_chunk(dataset, H5P_DEFAULT, 0, offset, chunk.size(),
+                     chunk.data());
+    } else {
+      const hsize_t count[3] = {1, SLOW, FAST};
+      h5utils::H5Space file_space(H5Dget_space(dataset));
+      H5Sselect_hyperslab(file_space, H5S_SELECT_SET, offset, nullptr, count,
+                          nullptr);
+      const hsize_t mem_dims[2] = {SLOW, FAST};
+      h5utils::H5Space mem_space(H5Screate_simple(2, mem_dims, nullptr));
+      H5Dwrite(dataset, type, mem_space, file_space, H5P_DEFAULT,
+               pixels.data());
+    }
+  }
+  return fixture;
+}
+
+template <typename T> std::span<const T> as_pixels(const Frame &frame) {
+  return frame.view().as<T>();
+}
+
+template <typename T> std::vector<T> to_vector(std::span<const T> s) {
+  return {s.begin(), s.end()};
+}
+
+} // namespace
+
+class H5ImageSourceEnvironment : public testing::Environment {
+public:
+  void TearDown() override { std::filesystem::remove_all(scratch_dir()); }
+};
+
+const auto *const environment =
+    testing::AddGlobalTestEnvironment(new H5ImageSourceEnvironment);
+
+template <typename T> class H5ImageSourceTypedTest : public testing::Test {};
+using TestedPixelTypes = testing::Types<uint16_t, uint32_t>;
+TYPED_TEST_SUITE(H5ImageSourceTypedTest, TestedPixelTypes);
+
+// Opening reports the dataset's extent, element type and pipeline, and
+// recognises the one-chunk-per-frame layout as raw-chunk capable.
+TYPED_TEST(H5ImageSourceTypedTest, OpenReportsShapeTypeAndCompression) {
+  const auto fixture = write_fixture<TypeParam>(
+      "open_" +
+          std::string(dx2::pixel_type_name(dx2::pixel_type_of_v<TypeParam>)),
+      Compression::BitshuffleLZ4);
+  H5ImageSource source(fixture.path);
+  EXPECT_EQ(source.num_frames(), NUM_FRAMES) << "Frame count differs";
+  EXPECT_EQ(source.shape(), (FrameShape{SLOW, FAST})) << "Shape differs";
+  EXPECT_EQ(source.pixel_type(), dx2::pixel_type_of_v<TypeParam>)
+      << "Pixel type differs";
+  EXPECT_EQ(source.compression(), Compression::BitshuffleLZ4)
+      << "Compression differs";
+  EXPECT_TRUE(source.supports_raw_chunks())
+      << "One chunk per frame with a codec must offer raw chunks";
+  EXPECT_EQ(source.frame_bytes(), SLOW * FAST * sizeof(TypeParam))
+      << "frame_bytes differs";
+  EXPECT_GE(source.max_raw_chunk_bytes(), source.frame_bytes())
+      << "The raw bound must cover an incompressible frame";
+}
+
+// Every frame decodes to the pixels written, for both element sizes; the
+// legacy reader could only ever get one of these right per build.
+TYPED_TEST(H5ImageSourceTypedTest, ReadFrameMatchesTheWrittenPixels) {
+  const auto fixture = write_fixture<TypeParam>(
+      "read_" +
+          std::string(dx2::pixel_type_name(dx2::pixel_type_of_v<TypeParam>)),
+      Compression::BitshuffleLZ4);
+  H5ImageSource source(fixture.path);
+  for (size_t frame = 0; frame < NUM_FRAMES; ++frame) {
+    Frame decoded = source.read_frame(frame);
+    EXPECT_EQ(to_vector(as_pixels<TypeParam>(decoded)),
+              expected_pixels<TypeParam>(frame))
+        << "Frame " << frame << " differs from what was written";
+  }
+}
+
+// A raw chunk read into a caller's buffer carries the filter header and
+// decodes, through a decoder built from the source's pipeline, to the
+// same pixels as read_frame. This is the GPU path.
+TEST(H5ImageSourceTest, RawChunkDecodesToTheSameFrame) {
+  const auto fixture =
+      write_fixture<uint16_t>("raw", Compression::BitshuffleLZ4);
+  H5ImageSource source(fixture.path);
+  std::vector<std::byte> buffer(source.max_raw_chunk_bytes());
+  RawChunk raw = source.read_raw_chunk(1, buffer);
+  EXPECT_EQ(raw.info.frame, 1u) << "ChunkInfo names the wrong frame";
+  EXPECT_EQ(raw.info.filter_mask, 0u) << "A filtered chunk has mask 0";
+  EXPECT_EQ(raw.bytes.size(), raw.info.stored_bytes)
+      << "bytes is not the stored chunk";
+  EXPECT_EQ(raw.header_bytes, 12u) << "bitshuffle+lz4 chunks have a header";
+  ASSERT_TRUE(raw.container_header()) << "No container header parsed";
+  EXPECT_EQ(raw.container_header()->uncompressed_bytes, source.frame_bytes())
+      << "Header does not record the frame size";
+  EXPECT_LT(raw.info.stored_bytes, source.frame_bytes())
+      << "Smooth test data did not compress";
+
+  ChunkDecoder decoder(source.filters(), source.pixel_type(), SLOW * FAST);
+  std::vector<uint16_t> decoded(SLOW * FAST);
+  decoder.decode(raw.bytes, raw.info.filter_mask,
+                 std::as_writable_bytes(std::span(decoded)));
+  EXPECT_EQ(decoded, expected_pixels<uint16_t>(1))
+      << "Raw chunk did not decode to the written pixels";
+}
+
+// HDF5 reading the same file through the filter plugin agrees with the
+// dx2 decoder, so the fixture is a file any NeXus consumer could read.
+TEST(H5ImageSourceTest, HdfReadThroughThePluginAgreesWithTheDecoder) {
+  if (H5Zfilter_avail(dx2::bitshuffle_filter_id) <= 0) {
+    GTEST_SKIP() << "bitshuffle plugin not loadable";
+  }
+  const auto fixture =
+      write_fixture<uint16_t>("plugin", Compression::BitshuffleLZ4);
+  H5ImageSource source(fixture.path);
+  Frame decoded = source.read_frame(2);
+
+  h5utils::H5File file(
+      H5Fopen(fixture.path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT));
+  h5utils::H5Dataset dataset(
+      H5Dopen2(file, fixture.dataset.c_str(), H5P_DEFAULT));
+  std::vector<uint16_t> all(NUM_FRAMES * SLOW * FAST);
+  ASSERT_GE(H5Dread(dataset, H5T_NATIVE_UINT16, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                    all.data()),
+            0)
+      << "H5Dread through the plugin failed";
+  std::vector<uint16_t> frame2(all.begin() + 2 * SLOW * FAST, all.end());
+  EXPECT_EQ(to_vector(as_pixels<uint16_t>(decoded)), frame2)
+      << "HDF5 and dx2 disagree on frame 2";
+}
+
+// Chunks that were never written have no ChunkInfo, as do frames beyond
+// the extent, and reading them is an error rather than fill values.
+TEST(H5ImageSourceTest, UnwrittenFrameHasNoChunkInfo) {
+  const auto fixture =
+      write_fixture<uint16_t>("partial", Compression::BitshuffleLZ4, 2);
+  H5ImageSource source(fixture.path);
+  EXPECT_TRUE(source.chunk_info(1)) << "Written frame 1 has no chunk";
+  EXPECT_FALSE(source.chunk_info(2)) << "Unwritten frame 2 has a chunk";
+  EXPECT_FALSE(source.chunk_info(NUM_FRAMES))
+      << "A frame beyond the extent has a chunk";
+  std::vector<std::byte> buffer(source.max_raw_chunk_bytes());
+  EXPECT_THROW(source.read_raw_chunk(2, buffer), std::runtime_error)
+      << "Reading an unwritten chunk did not throw";
+  EXPECT_THROW(source.read_frame(2), std::runtime_error)
+      << "Decoding an unwritten frame did not throw";
+}
+
+// wait_for_frame returns at once for a written frame and gives up at the
+// deadline for one that never arrives.
+TEST(H5ImageSourceTest, WaitForFrameHonoursTheDeadline) {
+  using namespace std::chrono;
+  const auto fixture =
+      write_fixture<uint16_t>("wait", Compression::BitshuffleLZ4, 1);
+  H5ImageSource source(fixture.path);
+  EXPECT_TRUE(source.wait_for_frame(0, 1s)) << "Written frame was waited on";
+
+  const auto start = steady_clock::now();
+  EXPECT_FALSE(source.wait_for_frame(1, 60ms, {}, 10ms))
+      << "Unwritten frame was reported readable";
+  const auto waited = steady_clock::now() - start;
+  EXPECT_GE(waited, 60ms) << "Gave up before the deadline";
+  EXPECT_LT(waited, 1s) << "Waited far past the deadline";
+
+  std::stop_source stop;
+  stop.request_stop();
+  EXPECT_FALSE(source.wait_for_frame(1, 10s, stop.get_token()))
+      << "A requested stop did not end the wait";
+}
+
+// A view of the wrong type or shape is refused before any read.
+TEST(H5ImageSourceTest, MismatchedViewIsRefused) {
+  const auto fixture =
+      write_fixture<uint16_t>("view", Compression::BitshuffleLZ4);
+  H5ImageSource source(fixture.path);
+  Frame wrong_type(PixelType::UInt32, FrameShape{SLOW, FAST});
+  EXPECT_THROW(source.read_frame_into(0, wrong_type.view()), std::runtime_error)
+      << "A uint32 view was accepted for uint16 data";
+  Frame wrong_shape(PixelType::UInt16, FrameShape{FAST, SLOW});
+  EXPECT_THROW(source.read_frame_into(0, wrong_shape.view()),
+               std::runtime_error)
+      << "A transposed view was accepted";
+}
+
+// An unfiltered chunked dataset still offers raw chunks, with no header,
+// and decodes by copy.
+TEST(H5ImageSourceTest, UnfilteredChunksAreOfferedRawWithoutAHeader) {
+  const auto fixture = write_fixture<uint16_t>("plain", Compression::None);
+  H5ImageSource source(fixture.path);
+  EXPECT_EQ(source.compression(), Compression::None) << "Compression differs";
+  EXPECT_TRUE(source.supports_raw_chunks()) << "Unfiltered chunks are raw";
+  std::vector<std::byte> buffer(source.max_raw_chunk_bytes());
+  RawChunk raw = source.read_raw_chunk(0, buffer);
+  EXPECT_EQ(raw.header_bytes, 0u) << "Unfiltered chunks have no header";
+  EXPECT_EQ(raw.info.stored_bytes, source.frame_bytes())
+      << "Unfiltered chunk is not frame sized";
+  EXPECT_EQ(to_vector(as_pixels<uint16_t>(source.read_frame(0))),
+            expected_pixels<uint16_t>(0))
+      << "Plain frame differs";
+}
+
+// A contiguous dataset has no chunks, so frames come through H5Dread.
+TEST(H5ImageSourceTest, ContiguousDatasetFallsBackToHyperslabReads) {
+  const auto fixture = write_fixture<uint16_t>("contiguous", Compression::None,
+                                               NUM_FRAMES, false);
+  H5ImageSource source(fixture.path);
+  EXPECT_FALSE(source.supports_raw_chunks())
+      << "A contiguous dataset cannot offer raw chunks";
+  EXPECT_FALSE(source.chunk_info(0)) << "A contiguous dataset has no chunks";
+  std::vector<std::byte> buffer(source.max_raw_chunk_bytes());
+  EXPECT_THROW(source.read_raw_chunk(0, buffer), std::runtime_error)
+      << "read_raw_chunk on a contiguous dataset did not throw";
+  for (size_t frame = 0; frame < NUM_FRAMES; ++frame) {
+    EXPECT_EQ(to_vector(as_pixels<uint16_t>(source.read_frame(frame))),
+              expected_pixels<uint16_t>(frame))
+        << "Frame " << frame << " differs through the hyperslab path";
+  }
+  EXPECT_THROW(source.read_frame(NUM_FRAMES), std::runtime_error)
+      << "A frame beyond the extent did not throw";
+}
+
+// Many threads reading every frame of one source at once all see the
+// written pixels; the HDF5 lock is the only serialisation.
+TEST(H5ImageSourceTest, ConcurrentReadersAgree) {
+  const auto fixture =
+      write_fixture<uint16_t>("threads", Compression::BitshuffleLZ4);
+  H5ImageSource source(fixture.path);
+  constexpr int NUM_THREADS = 8;
+  constexpr int ROUNDS = 20;
+  std::atomic<int> mismatches{0};
+  std::vector<std::jthread> threads;
+  for (int t = 0; t < NUM_THREADS; ++t) {
+    threads.emplace_back([&, t] {
+      std::vector<std::byte> buffer(source.max_raw_chunk_bytes());
+      for (int round = 0; round < ROUNDS; ++round) {
+        const size_t frame = (t + round) % NUM_FRAMES;
+        if (to_vector(as_pixels<uint16_t>(source.read_frame(frame))) !=
+            expected_pixels<uint16_t>(frame)) {
+          ++mismatches;
+        }
+        RawChunk raw = source.read_raw_chunk(frame, buffer);
+        if (raw.info.frame != frame) {
+          ++mismatches;
+        }
+      }
+    });
+  }
+  threads.clear();
+  EXPECT_EQ(mismatches.load(), 0) << "Concurrent reads returned wrong data";
+}
+
+// Errors name what was missing.
+TEST(H5ImageSourceTest, MissingFileOrDatasetThrowsWithTheName) {
+  const auto fixture =
+      write_fixture<uint16_t>("missing", Compression::BitshuffleLZ4);
+  h5utils::H5ErrorSilencer quiet;
+  try {
+    H5ImageSource source(fixture.path, {.dataset_path = "/entry/nothing"});
+    FAIL() << "A missing dataset did not throw";
+  } catch (const std::runtime_error &e) {
+    EXPECT_NE(std::string(e.what()).find("/entry/nothing"), std::string::npos)
+        << "Message does not name the dataset: " << e.what();
+  }
+  EXPECT_THROW(H5ImageSource(scratch_dir() / "absent.h5"), std::runtime_error)
+      << "A missing file did not throw";
+}

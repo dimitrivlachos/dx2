@@ -40,6 +40,9 @@ target_link_libraries(test_frame GTest::gtest_main dx2)
 add_executable(test_chunk_decoder test_chunk_decoder.cxx)
 target_link_libraries(test_chunk_decoder GTest::gtest_main dx2 hdf5::hdf5)
 
+add_executable(test_h5_image_source test_h5_image_source.cxx)
+target_link_libraries(test_h5_image_source GTest::gtest_main dx2 hdf5::hdf5)
+
 set(DX2_TESTS
     test_crystal
     test_beam
@@ -53,6 +56,7 @@ set(DX2_TESTS
     test_pixel_type
     test_frame
     test_chunk_decoder
+    test_h5_image_source
 )
 
 # Tests that open the same HDF5 files on disk. HDF5 locks a file opened for
@@ -62,6 +66,7 @@ set(DX2_HDF5_FILE_TESTS
     test_write_h5_array
     test_read_h5_array
     test_reflection_table
+    test_h5_image_source
 )
 
 foreach(t ${DX2_TESTS})

@@ -26,7 +26,9 @@
  *
  * encode produces the stored form of a chunk, header included, matching
  * the HDF5 filters byte for byte. It exists for writing test fixtures
- * and small files, not for a detector-rate writer.
+ * and small files, not for a detector-rate writer. encoded_bound is the
+ * largest stored chunk a given decoded size can produce, for sizing the
+ * buffers raw chunks are read into.
  */
 
 #pragma once
@@ -44,6 +46,7 @@ namespace dx2 {
 /// No filter: the stored chunk is the pixels. Also every masked chunk.
 struct IdentityCodec {
   size_t header_bytes() const { return 0; }
+  size_t encoded_bound(size_t decoded_bytes) const { return decoded_bytes; }
   void decode(std::span<const std::byte> raw, std::span<std::byte> dst) const;
   std::vector<std::byte> encode(std::span<const std::byte> pixels) const;
 };
@@ -54,6 +57,7 @@ struct BitshuffleCodec {
   /// Block size in elements; 0 is the library default.
   size_t block_elements;
   size_t header_bytes() const { return 0; }
+  size_t encoded_bound(size_t decoded_bytes) const { return decoded_bytes; }
   void decode(std::span<const std::byte> raw, std::span<std::byte> dst) const;
   std::vector<std::byte> encode(std::span<const std::byte> pixels) const;
 };
@@ -64,6 +68,7 @@ struct BitshuffleLz4Codec {
   /// Block size in elements used by encode; 0 is the library default.
   size_t block_elements;
   size_t header_bytes() const { return Lz4ContainerHeader::SIZE_BYTES; }
+  size_t encoded_bound(size_t decoded_bytes) const;
   void decode(std::span<const std::byte> raw, std::span<std::byte> dst) const;
   std::vector<std::byte> encode(std::span<const std::byte> pixels) const;
 };
@@ -75,6 +80,7 @@ struct BitshuffleZstdCodec {
   /// Block size in elements used by encode; 0 is the library default.
   size_t block_elements;
   size_t header_bytes() const { return Lz4ContainerHeader::SIZE_BYTES; }
+  size_t encoded_bound(size_t decoded_bytes) const;
   void decode(std::span<const std::byte> raw, std::span<std::byte> dst) const;
   std::vector<std::byte> encode(std::span<const std::byte> pixels) const;
 };
@@ -85,6 +91,7 @@ struct Lz4Codec {
   /// Block size in bytes used by encode; 0 means one block per chunk.
   size_t block_bytes;
   size_t header_bytes() const { return Lz4ContainerHeader::SIZE_BYTES; }
+  size_t encoded_bound(size_t decoded_bytes) const;
   void decode(std::span<const std::byte> raw, std::span<std::byte> dst) const;
   std::vector<std::byte> encode(std::span<const std::byte> pixels) const;
 };

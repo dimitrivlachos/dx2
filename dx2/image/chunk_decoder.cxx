@@ -167,6 +167,12 @@ BitshuffleCodec::encode(std::span<const std::byte> pixels) const {
   return out;
 }
 
+size_t BitshuffleLz4Codec::encoded_bound(size_t decoded_bytes) const {
+  return Lz4ContainerHeader::SIZE_BYTES +
+         bshuf_compress_lz4_bound(decoded_bytes / elem_size, elem_size,
+                                  block_elements);
+}
+
 void BitshuffleLz4Codec::decode(std::span<const std::byte> raw,
                                 std::span<std::byte> dst) const {
   check_whole_elements(dst, elem_size);
@@ -183,6 +189,17 @@ BitshuffleLz4Codec::encode(std::span<const std::byte> pixels) const {
   return encode_in_container(pixels, elem_size, block_elements,
                              bshuf_compress_lz4_bound, bshuf_compress_lz4,
                              "bitshuffle+lz4");
+}
+
+size_t BitshuffleZstdCodec::encoded_bound(size_t decoded_bytes) const {
+#ifdef ZSTD_SUPPORT
+  return Lz4ContainerHeader::SIZE_BYTES +
+         bshuf_compress_zstd_bound(decoded_bytes / elem_size, elem_size,
+                                   block_elements);
+#else
+  (void)decoded_bytes;
+  throw std::runtime_error("bitshuffle+zstd support is not compiled in");
+#endif
 }
 
 void BitshuffleZstdCodec::decode(std::span<const std::byte> raw,
@@ -216,6 +233,17 @@ BitshuffleZstdCodec::encode(std::span<const std::byte> pixels) const {
   (void)pixels;
   throw std::runtime_error("bitshuffle+zstd support is not compiled in");
 #endif
+}
+
+size_t Lz4Codec::encoded_bound(size_t decoded_bytes) const {
+  size_t block = block_bytes;
+  if (block == 0 || block > decoded_bytes) {
+    block = decoded_bytes;
+  }
+  const size_t blocks = block == 0 ? 0 : (decoded_bytes + block - 1) / block;
+  return Lz4ContainerHeader::SIZE_BYTES +
+         blocks * (4 + static_cast<size_t>(
+                           LZ4_compressBound(static_cast<int>(block))));
 }
 
 void Lz4Codec::decode(std::span<const std::byte> raw,
