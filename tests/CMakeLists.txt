@@ -3,6 +3,9 @@ include(GoogleTest)
 add_executable(test_crystal test_crystal.cxx)
 target_link_libraries(test_crystal GTest::gtest_main dx2 Eigen3::Eigen nlohmann_json::nlohmann_json gemmi::gemmi_cpp)
 
+add_executable(test_scan test_scan.cxx)
+target_link_libraries(test_scan GTest::gtest_main dx2 nlohmann_json::nlohmann_json)
+
 add_executable(test_beam test_beam.cxx)
 target_link_libraries(test_beam GTest::gtest_main dx2 Eigen3::Eigen nlohmann_json::nlohmann_json)
 
@@ -43,9 +46,16 @@ target_link_libraries(test_chunk_decoder GTest::gtest_main dx2 hdf5::hdf5)
 add_executable(test_h5_image_source test_h5_image_source.cxx)
 target_link_libraries(test_h5_image_source GTest::gtest_main dx2 hdf5::hdf5)
 
+add_executable(test_experiment test_experiment.cxx)
+target_link_libraries(test_experiment GTest::gtest_main dx2)
+
+add_executable(test_experiment_list test_experiment_list.cxx)
+target_link_libraries(test_experiment_list GTest::gtest_main dx2)
+
 set(DX2_TESTS
     test_crystal
     test_beam
+    test_scan
     test_beam_ops
     test_detector_attenuations
     test_goniometer
@@ -57,6 +67,8 @@ set(DX2_TESTS
     test_frame
     test_chunk_decoder
     test_h5_image_source
+    test_experiment
+    test_experiment_list
 )
 
 # Tests that open the same HDF5 files on disk. HDF5 locks a file opened for

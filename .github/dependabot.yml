@@ -1,0 +1,19 @@
+# The workflow actions name exact releases, so they never move to a newer
+# version on their own; this keeps them current. Each release is locked
+# to its commit in .github/workflows/actions.lock, and Dependabot
+# regenerates the matching entry in the same pull request. The conda pins
+# are kept current by the Conda update workflow instead.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    # A compromised release is usually caught and pulled within days, so
+    # hold off on proposing one until it has been out for a week.
+    cooldown:
+      default-days: 7
+    # One pull request per month rather than one per action
+    groups:
+      actions:
+        patterns: ["*"]

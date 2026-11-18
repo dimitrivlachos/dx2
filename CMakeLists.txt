@@ -11,6 +11,7 @@ if(PROJECT_IS_TOP_LEVEL)
     set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules")
     include(SetDefaultBuildRelWithDebInfo)
     include(AlwaysColourCompilation)
+    include(CheckCondaPins)
 endif()
 
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
