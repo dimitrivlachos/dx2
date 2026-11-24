@@ -1,5 +1,5 @@
 #include <array>
-#include <dx2/h5/h5read_processed.hpp>
+#include <dx2/h5/h5read.hpp>
 #include <dx2/h5/h5write.hpp>
 #include <filesystem>
 #include <gtest/gtest.h>

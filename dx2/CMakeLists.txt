@@ -2,8 +2,10 @@ add_library(
     dx2
     utils.cxx
     reflection.cxx
-    h5/h5read_processed.cxx
+    h5/h5read.cxx
     h5/h5write.cxx
+    h5/h5link.cxx
+    dials_format.cxx
     beam.cxx
     crystal.cxx
     detector.cxx
@@ -19,7 +21,6 @@ add_library(
     image/chunk_decoder.cxx
     image/image_source.cxx
     image/h5_image_source.cxx
-    h5/h5link.cxx
 )
 add_library(dx2::dx2 ALIAS dx2)
 

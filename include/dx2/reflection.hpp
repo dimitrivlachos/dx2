@@ -17,8 +17,9 @@
  */
 #pragma once
 
+#include "dx2/dials_format.hpp"
 #include "dx2/h5/h5dispatch.hpp"
-#include "dx2/h5/h5read_processed.hpp"
+#include "dx2/h5/h5read.hpp"
 #include "dx2/h5/h5utils.hpp"
 #include "dx2/h5/h5write.hpp"
 #include "dx2/logging.hpp"

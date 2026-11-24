@@ -1,4 +1,4 @@
-#include <dx2/h5/h5read_processed.hpp>
+#include <dx2/h5/h5read.hpp>
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <hdf5.h>

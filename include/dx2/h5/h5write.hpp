@@ -347,31 +347,3 @@ void write_data_to_h5_file(std::string_view filename,
   }
 }
 #pragma endregion
-#pragma region Attribute writer
-void write_experiment_metadata(hid_t group_id,
-                               const std::vector<uint64_t> &experiment_ids,
-                               const std::vector<std::string> &identifiers);
-
-/// Value of the root `file_type` attribute that DIALS (>= 3.31) requires
-/// before it will read a reflection file.
-constexpr std::string_view DIALS_FILE_TYPE = "dials_processed_data";
-
-/// Version of the DIALS processed-data layout dx2 writes. Version 1 keeps
-/// each table at `/dials/<process>/<group>`.
-constexpr int64_t DIALS_FILE_VERSION = 1;
-
-/**
- * @brief Marks an HDF5 file as DIALS processed data.
- *
- * Writes `file_type` and `file_version` on the file root, with the types
- * h5py gives a Python `str` and `int`: a scalar variable-length UTF-8
- * string and a scalar 64-bit integer. DIALS compares both as Python
- * objects, so a fixed-length string (read back as `bytes`) or a
- * one-element array would fail its check. The format is defined in
- * `dials/util/table_as_hdf5_file.py` (dials/dials@02bb48d).
- *
- * @param file_id An open, writable HDF5 file without these attributes.
- * @throws std::runtime_error If either attribute cannot be written.
- */
-void write_file_format_attributes(hid_t file_id);
-#pragma endregion
