@@ -711,3 +711,191 @@ TEST(H5ImageLayoutTest, SourcesWithDifferentShapesAreRefused) {
   EXPECT_THROW(H5ImageSource source(master), std::runtime_error)
       << "sources of different shape were accepted";
 }
+
+namespace {
+
+/// A file access list for the latest file format, which SWMR writing
+/// requires.
+h5utils::H5Plist latest_fapl() {
+  h5utils::H5Plist fapl(H5Pcreate(H5P_FILE_ACCESS));
+  H5Pset_libver_bounds(fapl, H5F_LIBVER_LATEST, H5F_LIBVER_LATEST);
+  return fapl;
+}
+
+/// Creates a bitshuffle-LZ4 /entry/data/data of no frames yet with an
+/// unlimited frame extent, in a file a SWMR writer can open.
+void create_growing_file(const std::filesystem::path &path) {
+  std::filesystem::create_directories(path.parent_path());
+  h5utils::H5File file(
+      H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, latest_fapl()));
+  h5utils::H5Group entry(
+      H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Group data(
+      H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  const hsize_t dims[3] = {0, SLOW, FAST};
+  const hsize_t max_dims[3] = {H5S_UNLIMITED, SLOW, FAST};
+  const hsize_t chunk[3] = {1, SLOW, FAST};
+  h5utils::H5Plist dcpl(H5Pcreate(H5P_DATASET_CREATE));
+  H5Pset_chunk(dcpl, 3, chunk);
+  const unsigned user_values[2] = {0, 2};
+  H5Pset_filter(dcpl, dx2::bitshuffle_filter_id, H5Z_FLAG_OPTIONAL, 2,
+                user_values);
+  h5utils::H5Space space(H5Screate_simple(3, dims, max_dims));
+  h5utils::H5Type type = h5dispatch::H5TypeTraits<Pixel>::make();
+  h5utils::H5Dataset dataset(
+      H5Dcreate2(data, "data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT));
+  ASSERT_TRUE(dataset) << "could not create the growing dataset";
+}
+
+} // namespace
+
+// A SWMR writer extends the dataset one frame at a time and flushes while
+// four readers each wait for the next unclaimed frame. Every frame must be
+// delivered with its own pattern, the count must follow the extent, and a
+// frame past the end must still time out. The writer shares the readers'
+// process, so this exercises the refresh path rather than cross-process
+// consistency, and the writer must hold the file before a SWMR reader
+// opens it.
+TEST(H5ImageSwmrTest, GrowingDatasetIsFollowedByWaitingReaders) {
+  using namespace std::chrono_literals;
+  constexpr size_t FRAMES = 6;
+  constexpr size_t READERS = 4;
+  const auto path = scratch_dir() / "swmr_grow" / "data.h5";
+  create_growing_file(path);
+
+  // The writer opens first and waits for the go signal, so the reader can
+  // observe the empty dataset before anything is written.
+  std::atomic<bool> writer_open{false};
+  std::atomic<bool> go{false};
+  std::thread writer([&] {
+    h5utils::H5File file(H5Fopen(
+        path.c_str(), H5F_ACC_RDWR | H5F_ACC_SWMR_WRITE, latest_fapl()));
+    h5utils::H5Dataset dataset(H5Dopen2(file, "/entry/data/data", H5P_DEFAULT));
+    writer_open = true;
+    while (!go) {
+      std::this_thread::sleep_for(1ms);
+    }
+    for (size_t k = 0; k < FRAMES; ++k) {
+      const hsize_t extent[3] = {k + 1, SLOW, FAST};
+      H5Dset_extent(dataset, extent);
+      write_frame(dataset, k, k, Compression::BitshuffleLZ4);
+      H5Dflush(dataset);
+      std::this_thread::sleep_for(30ms);
+    }
+  });
+  while (!writer_open) {
+    std::this_thread::sleep_for(1ms);
+  }
+
+  H5ImageSource::Options options;
+  options.swmr = true;
+  options.refresh_min_interval = 5ms;
+  H5ImageSource source(path, options);
+  EXPECT_EQ(source.num_frames(), 0u) << "no frame has been written yet";
+  EXPECT_FALSE(source.chunk_info(0)) << "frame 0 reported before it exists";
+  go = true;
+
+  // Readers claim frames in turn and wait for each one.
+  std::atomic<size_t> next{0};
+  std::atomic<size_t> delivered{0};
+  std::vector<std::thread> readers;
+  for (size_t r = 0; r < READERS; ++r) {
+    readers.emplace_back([&] {
+      for (size_t f = next++; f < FRAMES; f = next++) {
+        ASSERT_TRUE(source.wait_for_frame(f, 10s, {}, 5ms))
+            << "frame " << f << " did not arrive";
+        const Frame frame = source.read_frame(f);
+        EXPECT_EQ(to_vector(as_pixels<Pixel>(frame)), expected_pixels<Pixel>(f))
+            << "frame " << f << " differs";
+        ++delivered;
+      }
+    });
+  }
+  for (std::thread &reader : readers) {
+    reader.join();
+  }
+  writer.join();
+  EXPECT_EQ(delivered.load(), FRAMES) << "not every frame was delivered";
+  EXPECT_EQ(source.num_frames(), FRAMES) << "count did not follow the extent";
+  EXPECT_FALSE(source.wait_for_frame(FRAMES, 50ms, {}, 5ms))
+      << "a frame past the end was reported";
+}
+
+// A virtual dataset names a second file that is not there when the source
+// opens. In SWMR mode its frames report no chunk, quietly, until the file
+// appears; without SWMR the open is an error naming the file.
+TEST(H5ImageSwmrTest, AwaitedSourceFileGivesNoChunkUntilItAppears) {
+  const auto dir = scratch_dir() / "swmr_await";
+  write_data_file(dir / "data_a.h5", {0, 1}, Compression::BitshuffleLZ4);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    add_vds(file,
+            {{"data_a.h5", "/entry/data/data", 0, 0, 2},
+             {"data_b.h5", "/entry/data/data", 2, 0, 2}},
+            4);
+  }
+  EXPECT_THROW(
+      {
+        try {
+          H5ImageSource plain(master);
+        } catch (const std::runtime_error &e) {
+          EXPECT_NE(std::string(e.what()).find("data_b.h5"), std::string::npos)
+              << "error does not name the file: " << e.what();
+          throw;
+        }
+      },
+      std::runtime_error)
+      << "a missing source without SWMR must be an error";
+
+  H5ImageSource::Options options;
+  options.swmr = true;
+  H5ImageSource source(master, options);
+  ASSERT_EQ(source.sources().size(), 2u) << "both sources should be listed";
+  EXPECT_FALSE(source.sources()[1].open) << "the missing file counts as open";
+  EXPECT_EQ(source.num_frames(), 4u) << "a fixed mapping keeps its count";
+  EXPECT_TRUE(source.chunk_info(1)) << "frame 1 is in the file that exists";
+  EXPECT_FALSE(source.chunk_info(2)) << "frame 2 reported before its file";
+  EXPECT_THROW(source.read_frame(2), std::runtime_error)
+      << "reading an awaited frame must throw";
+
+  write_data_file(dir / "data_b.h5", {2, 3}, Compression::BitshuffleLZ4);
+  EXPECT_TRUE(source.chunk_info(2))
+      << "frame 2 missing after its file appeared";
+  EXPECT_TRUE(source.sources()[1].open) << "the late file was not opened";
+  expect_frames(source, {0, 1, 2, 3}, "after the second file appeared");
+}
+
+// A source that appears late with a different image size cannot be
+// checked at open, so the request that opens it throws instead.
+TEST(H5ImageSwmrTest, LateSourceWithADifferentShapeIsRefusedWhenItAppears) {
+  const auto dir = scratch_dir() / "swmr_late_shape";
+  write_data_file(dir / "data_a.h5", {0}, Compression::BitshuffleLZ4);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    add_vds(file,
+            {{"data_a.h5", "/entry/data/data", 0, 0, 1},
+             {"data_b.h5", "/entry/data/data", 1, 0, 1}},
+            2);
+  }
+  H5ImageSource::Options options;
+  options.swmr = true;
+  H5ImageSource source(master, options);
+  EXPECT_FALSE(source.chunk_info(1)) << "frame 1 reported before its file";
+
+  // The late file is half as wide as the first.
+  {
+    std::filesystem::create_directories(dir);
+    h5utils::H5File file(H5Fcreate((dir / "data_b.h5").c_str(), H5F_ACC_TRUNC,
+                                   H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group entry(
+        H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group data(
+        H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Dataset narrow =
+        create_frames(data, "data", 1, Compression::BitshuffleLZ4, FAST / 2);
+  }
+  EXPECT_THROW(source.chunk_info(1), std::runtime_error)
+      << "a late source of another shape must be refused";
+}

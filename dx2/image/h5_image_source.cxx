@@ -73,6 +73,14 @@ struct UnsupportedMapping : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+/// The frame extent of an open dataset.
+size_t frame_extent(hid_t dataset) {
+  H5Space space(H5Dget_space(dataset));
+  hsize_t dims[3] = {};
+  H5Sget_simple_extent_dims(space, dims, nullptr);
+  return dims[0];
+}
+
 } // namespace
 
 H5ImageSource::H5ImageSource(const fs::path &path, Options options)
@@ -87,9 +95,17 @@ H5ImageSource::H5ImageSource(const fs::path &path, Options options)
   }
   discover_layout();
 
-  // Every source must agree with the first on shape, type and pipeline;
-  // raw chunks need every source to offer them.
-  const Source &first = sources_.front();
+  // The first source that exists sets the shape, type and pipeline every
+  // other source, now or later, has to match.
+  const auto reference = std::find_if(
+      sources_.begin(), sources_.end(),
+      [](const std::unique_ptr<Source> &s) { return s->open.load(); });
+  if (reference == sources_.end()) {
+    throw std::runtime_error(fmt::format(
+        "no source file of {} in {} exists yet", options_.dataset_path, path_));
+  }
+  reference_ = static_cast<size_t>(reference - sources_.begin());
+  const Source &first = **reference;
   {
     H5Space space(H5Dget_space(first.dataset_handle));
     hsize_t dims[3] = {};
@@ -97,33 +113,17 @@ H5ImageSource::H5ImageSource(const fs::path &path, Options options)
     shape_ = {dims[1], dims[2]};
   }
   pixel_type_ = pixel_type_from_h5(first.dataset_handle);
+
+  // Raw chunks need every source open now to offer them; one opened later
+  // is held to the same standard when it opens.
   raw_chunks_ = true;
-  for (const Source &source : sources_) {
-    H5Space space(H5Dget_space(source.dataset_handle));
-    hsize_t dims[3] = {};
-    H5Sget_simple_extent_dims(space, dims, nullptr);
-    if (dims[1] != shape_[0] || dims[2] != shape_[1]) {
-      throw std::runtime_error(fmt::format(
-          "{} in {} is {}x{}, {} in {} is {}x{}", source.dataset, source.file,
-          dims[1], dims[2], first.dataset, first.file, shape_[0], shape_[1]));
+  for (const std::unique_ptr<Source> &source : sources_) {
+    if (!source->open.load()) {
+      continue;
     }
-    if (pixel_type_from_h5(source.dataset_handle) != pixel_type_) {
-      throw std::runtime_error(
-          fmt::format("{} in {} has a different pixel type from {} in {}",
-                      source.dataset, source.file, first.dataset, first.file));
-    }
-    if (source.filters.summary() != first.filters.summary()) {
-      throw std::runtime_error(
-          fmt::format("{} in {} is {} compressed, {} in {} is {}",
-                      source.dataset, source.file,
-                      compression_name(source.filters.summary()), first.dataset,
-                      first.file, compression_name(first.filters.summary())));
-    }
-    raw_chunks_ =
-        raw_chunks_ && source.one_chunk_per_frame && source.decoder.has_value();
-  }
-  for (const Segment &segment : segments_) {
-    num_frames_ = std::max(num_frames_, segment.first + segment.count);
+    check_matches_reference(*source);
+    raw_chunks_ = raw_chunks_ && source->one_chunk_per_frame &&
+                  source->decoder.has_value();
   }
 }
 
@@ -144,17 +144,22 @@ void H5ImageSource::discover_layout() {
       h5link::LinkKind::External, options_.vds_prefix, path_);
   const h5link::ResolvedLink target =
       h5link::resolve_link(master_, path_, options_.dataset_path, prefixes);
-  if (!target.file_exists) {
+  if (!target.file_exists && !options_.swmr) {
     throw std::runtime_error(fmt::format("{} in {} points at {}, which does "
                                          "not exist",
                                          options_.dataset_path, path_,
                                          target.file));
   }
-  // Adding sources reallocates sources_, so the dataset is referred to by
-  // index and its handle and path are copied out first.
-  const size_t index = add_source(target.file, target.object_path);
-  const hid_t dataset = sources_[index].dataset_handle;
-  const fs::path dataset_file = sources_[index].file;
+  const size_t index =
+      add_source(target.file, target.object_path, target.file_exists);
+  if (!target.file_exists) {
+    // A plain dataset awaited in SWMR mode; its layout is checked when it
+    // appears.
+    segments_.push_back({0, 0, index, 0, true});
+    return;
+  }
+  const hid_t dataset = sources_[index]->dataset_handle;
+  const fs::path dataset_file = sources_[index]->file;
   H5Plist dcpl(H5Dget_create_plist(dataset));
   if (H5Pget_layout(dcpl) == H5D_VIRTUAL) {
     // The virtual dataset is replaced by its sources when every mapping
@@ -166,7 +171,7 @@ void H5ImageSource::discover_layout() {
     } catch (const UnsupportedMapping &) {
       sources_.resize(before);
       segments_.clear();
-      segments_.push_back({0, sources_[index].num_frames, index, 0});
+      segments_.push_back({0, 0, index, 0, true});
       return;
     }
     sources_.erase(sources_.begin() + static_cast<ptrdiff_t>(index));
@@ -177,7 +182,8 @@ void H5ImageSource::discover_layout() {
     }
     return;
   }
-  segments_.push_back({0, sources_[index].num_frames, index, 0});
+  // A plain dataset is one open-ended run so a growing extent is followed.
+  segments_.push_back({0, 0, index, 0, true});
 }
 
 void H5ImageSource::add_virtual_segments(hid_t vds, const fs::path &vds_file) {
@@ -199,10 +205,8 @@ void H5ImageSource::add_virtual_segments(hid_t vds, const fs::path &vds_file) {
       h5link::LinkKind::External, options_.vds_prefix, vds_file);
 
   for (size_t i = 0; i < count; ++i) {
-    // Both selections must be whole frames: the virtual side says which
-    // frames, the source side says where they come from.
+    // The virtual selection must be whole frames: it says which frames.
     H5Space vspace(H5Pget_virtual_vspace(dcpl, i));
-    H5Space sspace(H5Pget_virtual_srcspace(dcpl, i));
     const std::optional<FrameRun> virtual_run = whole_frame_run(vspace, vdims);
     if (!virtual_run) {
       throw UnsupportedMapping("virtual mapping is not whole frames");
@@ -216,48 +220,45 @@ void H5ImageSource::add_virtual_segments(hid_t vds, const fs::path &vds_file) {
       throw UnsupportedMapping("printf-style virtual mapping");
     }
 
-    // The source name may itself be a link chain inside the source file.
+    // The source name may itself be a link chain inside the source file,
+    // which can only be followed once the file is there; until then the
+    // name is taken as given.
     const h5link::ResolvedLink found =
         h5link::find_linked_file(file_name, vds_file, vds_prefixes);
-    if (!found.file_exists) {
+    h5link::ResolvedLink target{found.file, dataset_name, false};
+    if (found.file_exists) {
+      h5utils::H5File source_file(
+          H5Fopen(found.file.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT));
+      if (!source_file) {
+        throw std::runtime_error(fmt::format("cannot open {}", found.file));
+      }
+      target = h5link::resolve_link(source_file, found.file, dataset_name,
+                                    elink_prefixes);
+    }
+    if (!target.file_exists && !options_.swmr) {
       throw std::runtime_error(fmt::format(
-          "virtual source {} of {} does not exist", found.file, vds_file));
+          "virtual source {} of {} does not exist", target.file, vds_file));
     }
-    h5utils::H5File source_file(
-        H5Fopen(found.file.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT));
-    if (!source_file) {
-      throw std::runtime_error(fmt::format("cannot open {}", found.file));
-    }
-    const h5link::ResolvedLink target = h5link::resolve_link(
-        source_file, found.file, dataset_name, elink_prefixes);
-    if (!target.file_exists) {
-      throw std::runtime_error(
-          fmt::format("{} in {} points at {}, which does not exist",
-                      dataset_name, found.file, target.file));
-    }
-    const size_t index = add_source(target.file, target.object_path);
-    const size_t source_frames = sources_[index].num_frames;
+    const size_t index =
+        add_source(target.file, target.object_path, target.file_exists);
 
-    hsize_t sdims[3] = {};
-    {
-      H5Space space(H5Dget_space(sources_[index].dataset_handle));
+    // The source selection must be whole frames of the source's own image
+    // size, which is only known once the source is open; an awaited
+    // source is held to the virtual size and checked when it appears.
+    hsize_t sdims[3] = {vdims[0], vdims[1], vdims[2]};
+    if (sources_[index]->open.load()) {
+      H5Space space(H5Dget_space(sources_[index]->dataset_handle));
       H5Sget_simple_extent_dims(space, sdims, nullptr);
     }
+    H5Space sspace(H5Pget_virtual_srcspace(dcpl, i));
     const std::optional<FrameRun> source_run = whole_frame_run(sspace, sdims);
     if (!source_run) {
       throw UnsupportedMapping("virtual source selection is not whole frames");
     }
-    // An unlimited run takes every frame the source has from its start.
-    const size_t frames =
-        virtual_run->count
-            ? static_cast<size_t>(*virtual_run->count)
-            : source_frames -
-                  std::min<size_t>(source_frames, source_run->first);
-    if (frames == 0) {
-      continue;
-    }
-    segments_.push_back({static_cast<size_t>(virtual_run->first), frames, index,
-                         static_cast<size_t>(source_run->first)});
+    segments_.push_back({static_cast<size_t>(virtual_run->first),
+                         static_cast<size_t>(virtual_run->count.value_or(0)),
+                         index, static_cast<size_t>(source_run->first),
+                         !virtual_run->count.has_value()});
   }
   if (segments_.empty()) {
     throw UnsupportedMapping("virtual dataset maps no frames");
@@ -293,6 +294,8 @@ void H5ImageSource::add_numbered_datasets() {
   }
   std::sort(names.begin(), names.end());
 
+  // Each file's frames start where the extents before it add up to, so
+  // every file has to be there to be measured.
   const std::vector<fs::path> prefixes = h5link::link_search_prefixes(
       h5link::LinkKind::External, options_.vds_prefix, path_);
   size_t next_frame = 0;
@@ -306,49 +309,59 @@ void H5ImageSource::add_numbered_datasets() {
           fmt::format("{} in {} points at {}, which does not exist", link_path,
                       path_, target.file));
     }
-    const size_t index = add_source(target.file, target.object_path);
-    const size_t frames = sources_[index].num_frames;
-    segments_.push_back({next_frame, frames, index, 0});
+    const size_t index = add_source(target.file, target.object_path, true);
+    const size_t frames = sources_[index]->num_frames.load();
+    segments_.push_back({next_frame, frames, index, 0, false});
     next_frame += frames;
   }
 }
 
 size_t H5ImageSource::add_source(const fs::path &file,
-                                 const std::string &dataset) {
+                                 const std::string &dataset, bool file_exists) {
   // The same dataset reached twice is one source.
   for (size_t i = 0; i < sources_.size(); ++i) {
-    if (sources_[i].file == file && sources_[i].dataset == dataset) {
+    if (sources_[i]->file == file && sources_[i]->dataset == dataset) {
       return i;
     }
   }
-  Source source;
-  source.file = file;
-  source.dataset = dataset;
-  unsigned flags = H5F_ACC_RDONLY;
-  if (options_.swmr) {
-    flags |= H5F_ACC_SWMR_READ;
+  auto source = std::make_unique<Source>();
+  source->file = file;
+  source->dataset = dataset;
+  if (file_exists) {
+    unsigned flags = H5F_ACC_RDONLY;
+    if (options_.swmr) {
+      flags |= H5F_ACC_SWMR_READ;
+    }
+    source->file_handle =
+        h5utils::H5File(H5Fopen(file.c_str(), flags, H5P_DEFAULT));
+    if (!source->file_handle) {
+      throw std::runtime_error(fmt::format("cannot open {}", file));
+    }
+    open_dataset(*source);
+    source->open.store(true);
   }
-  source.file_handle =
-      h5utils::H5File(H5Fopen(file.c_str(), flags, H5P_DEFAULT));
-  if (!source.file_handle) {
-    throw std::runtime_error(fmt::format("cannot open {}", file));
-  }
+  sources_.push_back(std::move(source));
+  return sources_.size() - 1;
+}
+
+void H5ImageSource::open_dataset(Source &source) {
   source.dataset_handle = h5utils::H5Dataset(
-      H5Dopen2(source.file_handle, dataset.c_str(), H5P_DEFAULT));
+      H5Dopen2(source.file_handle, source.dataset.c_str(), H5P_DEFAULT));
   if (!source.dataset_handle) {
-    throw std::runtime_error(fmt::format("no dataset {} in {}", dataset, file));
+    throw std::runtime_error(
+        fmt::format("no dataset {} in {}", source.dataset, source.file));
   }
 
   // The dataset must be {frames, slow, fast}; raw chunks need one chunk
   // per frame and a codec for the pipeline.
   H5Space space(H5Dget_space(source.dataset_handle));
   if (!space || H5Sget_simple_extent_ndims(space) != 3) {
-    throw std::runtime_error(
-        fmt::format("{} in {} is not a 3-D dataset", dataset, file));
+    throw std::runtime_error(fmt::format("{} in {} is not a 3-D dataset",
+                                         source.dataset, source.file));
   }
   hsize_t dims[3] = {};
   H5Sget_simple_extent_dims(space, dims, nullptr);
-  source.num_frames = dims[0];
+  source.num_frames.store(dims[0]);
   H5Plist dcpl(H5Dget_create_plist(source.dataset_handle));
   source.filters = FilterPipeline::from_plist(dcpl);
   if (H5Pget_layout(dcpl) == H5D_CHUNKED) {
@@ -363,65 +376,151 @@ size_t H5ImageSource::add_source(const fs::path &file,
       ChunkDecoder::can_decode(source.filters, type)) {
     source.decoder.emplace(source.filters, type, dims[1] * dims[2]);
   }
-  sources_.push_back(std::move(source));
-  return sources_.size() - 1;
+}
+
+void H5ImageSource::check_matches_reference(const Source &source) const {
+  const Source &first = *sources_[reference_];
+  H5Space space(H5Dget_space(source.dataset_handle));
+  hsize_t dims[3] = {};
+  H5Sget_simple_extent_dims(space, dims, nullptr);
+  if (dims[1] != shape_[0] || dims[2] != shape_[1]) {
+    throw std::runtime_error(fmt::format(
+        "{} in {} is {}x{}, {} in {} is {}x{}", source.dataset, source.file,
+        dims[1], dims[2], first.dataset, first.file, shape_[0], shape_[1]));
+  }
+  if (pixel_type_from_h5(source.dataset_handle) != pixel_type_) {
+    throw std::runtime_error(
+        fmt::format("{} in {} has a different pixel type from {} in {}",
+                    source.dataset, source.file, first.dataset, first.file));
+  }
+  if (source.filters.summary() != first.filters.summary()) {
+    throw std::runtime_error(fmt::format(
+        "{} in {} is {} compressed, {} in {} is {}", source.dataset,
+        source.file, compression_name(source.filters.summary()), first.dataset,
+        first.file, compression_name(first.filters.summary())));
+  }
+}
+
+bool H5ImageSource::ensure_open(Source &source) {
+  if (source.open.load(std::memory_order_acquire)) {
+    return true;
+  }
+  std::lock_guard lock(source.mutex);
+  if (source.open.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  // A file that cannot be opened yet is one still being written; the
+  // open is tried again on the next request.
+  {
+    h5utils::H5ErrorSilencer silence;
+    source.file_handle = h5utils::H5File(H5Fopen(
+        source.file.c_str(), H5F_ACC_RDONLY | H5F_ACC_SWMR_READ, H5P_DEFAULT));
+  }
+  if (!source.file_handle) {
+    return false;
+  }
+  open_dataset(source);
+  check_matches_reference(source);
+  if (raw_chunks_ && !(source.one_chunk_per_frame && source.decoder)) {
+    throw std::runtime_error(
+        fmt::format("{} in {} does not offer raw chunks like the other "
+                    "sources of {}",
+                    source.dataset, source.file, path_));
+  }
+  source.open.store(true, std::memory_order_release);
+  return true;
+}
+
+void H5ImageSource::refresh(Source &source) {
+  std::lock_guard lock(source.mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - source.last_refresh < options_.refresh_min_interval) {
+    return;
+  }
+  // The refresh re-reads the dataset's metadata, including its chunk
+  // index and extent, from the file as the writer last flushed it.
+  if (H5Drefresh(source.dataset_handle) < 0) {
+    throw std::runtime_error(
+        fmt::format("cannot refresh {} in {}", source.dataset, source.file));
+  }
+  source.num_frames.store(frame_extent(source.dataset_handle));
+  source.last_refresh = now;
+}
+
+size_t H5ImageSource::segment_frames(const Segment &segment) const {
+  if (!segment.unlimited) {
+    return segment.count;
+  }
+  const size_t extent = sources_[segment.source]->num_frames.load();
+  return extent > segment.source_first ? extent - segment.source_first : 0;
+}
+
+size_t H5ImageSource::num_frames() const {
+  size_t frames = 0;
+  for (const Segment &segment : segments_) {
+    frames = std::max(frames, segment.first + segment_frames(segment));
+  }
+  return frames;
 }
 
 std::vector<H5ImageSource::SourceInfo> H5ImageSource::sources() const {
   std::vector<SourceInfo> info;
   info.reserve(sources_.size());
-  for (const Source &source : sources_) {
-    info.push_back({source.file, source.dataset, source.num_frames});
+  for (const std::unique_ptr<Source> &source : sources_) {
+    info.push_back({source->file, source->dataset, source->num_frames.load(),
+                    source->open.load()});
   }
   return info;
 }
 
-H5ImageSource::Located H5ImageSource::locate(size_t frame) {
-  if (frame >= num_frames_) {
-    throw std::runtime_error(
-        fmt::format("frame {} of {} is beyond the {} in {}", frame,
-                    options_.dataset_path, num_frames_, path_));
-  }
+std::optional<H5ImageSource::Located> H5ImageSource::locate(size_t frame) {
   // Segments are sorted by first frame; the last one starting at or
-  // before the frame holds it, unless the frame falls in a gap.
+  // before the frame holds it, unless the frame falls in a gap or past a
+  // fixed run. An unlimited run takes every later frame, written or not.
   auto after =
       std::upper_bound(segments_.begin(), segments_.end(), frame,
                        [](size_t f, const Segment &s) { return f < s.first; });
   if (after == segments_.begin()) {
-    throw std::runtime_error(
-        fmt::format("frame {} of {} is not mapped", frame, path_));
+    return std::nullopt;
   }
   const Segment &segment = *(after - 1);
-  if (frame >= segment.first + segment.count) {
+  if (!segment.unlimited && frame >= segment.first + segment.count) {
+    return std::nullopt;
+  }
+  return Located{*sources_[segment.source],
+                 segment.source_first + (frame - segment.first)};
+}
+
+H5ImageSource::Located H5ImageSource::locate_open(size_t frame) {
+  std::optional<Located> at = locate(frame);
+  if (!at) {
     throw std::runtime_error(
         fmt::format("frame {} of {} is not mapped", frame, path_));
   }
-  return {sources_[segment.source],
-          segment.source_first + (frame - segment.first)};
+  if (!ensure_open(at->source)) {
+    throw std::runtime_error(fmt::format("frame {} of {} is in {}, which "
+                                         "does not exist yet",
+                                         frame, path_, at->source.file));
+  }
+  return *at;
 }
 
 size_t H5ImageSource::max_raw_chunk_bytes() const {
   size_t bound = 0;
-  for (const Source &source : sources_) {
-    bound = std::max(bound, source.decoder ? std::visit(
-                                                 [&](const auto &codec) {
-                                                   return codec.encoded_bound(
-                                                       frame_bytes());
-                                                 },
-                                                 source.decoder->codec())
-                                           : frame_bytes());
+  for (const std::unique_ptr<Source> &source : sources_) {
+    bound = std::max(bound, source->decoder ? std::visit(
+                                                  [&](const auto &codec) {
+                                                    return codec.encoded_bound(
+                                                        frame_bytes());
+                                                  },
+                                                  source->decoder->codec())
+                                            : frame_bytes());
   }
   return bound;
 }
 
-std::optional<ChunkInfo> H5ImageSource::chunk_info(size_t frame) {
-  if (frame >= num_frames_) {
-    return std::nullopt;
-  }
-  const Located at = locate(frame);
-  // A frame the source has not grown to yet, or a layout without one
-  // chunk per frame, has no chunk to report.
-  if (!at.source.one_chunk_per_frame || at.local >= at.source.num_frames) {
+std::optional<ChunkInfo> H5ImageSource::query_chunk(Located at, size_t frame) {
+  if (at.local >= at.source.num_frames.load()) {
     return std::nullopt;
   }
   // An allocated chunk has an address and a size; an unwritten one
@@ -443,6 +542,25 @@ std::optional<ChunkInfo> H5ImageSource::chunk_info(size_t frame) {
                    static_cast<size_t>(size)};
 }
 
+std::optional<ChunkInfo> H5ImageSource::chunk_info(size_t frame) {
+  const std::optional<Located> at = locate(frame);
+  if (!at || !ensure_open(at->source)) {
+    return std::nullopt;
+  }
+  // A layout without one chunk per frame has no chunk to report.
+  if (!at->source.one_chunk_per_frame) {
+    return std::nullopt;
+  }
+  // A frame the source has not grown to, or not written, may have arrived
+  // since the metadata was last read; in SWMR mode one refresh settles it.
+  std::optional<ChunkInfo> info = query_chunk(*at, frame);
+  if (!info && options_.swmr) {
+    refresh(at->source);
+    info = query_chunk(*at, frame);
+  }
+  return info;
+}
+
 RawChunk H5ImageSource::read_raw_chunk(size_t frame, std::span<std::byte> dst) {
   if (!raw_chunks_) {
     throw std::runtime_error(fmt::format(
@@ -459,7 +577,7 @@ RawChunk H5ImageSource::read_raw_chunk(size_t frame, std::span<std::byte> dst) {
         fmt::format("chunk {} is {} bytes, buffer holds {}", frame,
                     info->stored_bytes, dst.size()));
   }
-  const Located at = locate(frame);
+  const Located at = locate_open(frame);
   const hsize_t offset[3] = {at.local, 0, 0};
   uint32_t filter_mask = 0;
   if (H5Dread_chunk(at.source.dataset_handle, H5P_DEFAULT, offset, &filter_mask,
@@ -480,7 +598,7 @@ void H5ImageSource::read_frame_into(size_t frame, FrameView dst) {
                     shape_[1], pixel_type_name(pixel_type_)));
   }
   if (!raw_chunks_) {
-    read_frame_hyperslab(locate(frame), dst);
+    read_frame_hyperslab(locate_open(frame), dst);
     return;
   }
   // The stored chunk lands in a per-thread buffer that grows to the
@@ -495,12 +613,15 @@ void H5ImageSource::read_frame_into(size_t frame, FrameView dst) {
     scratch.resize(info->stored_bytes);
   }
   const RawChunk raw = read_raw_chunk(frame, scratch);
-  locate(frame).source.decoder->decode(raw.bytes, raw.info.filter_mask,
-                                       dst.bytes());
+  locate_open(frame).source.decoder->decode(raw.bytes, raw.info.filter_mask,
+                                            dst.bytes());
 }
 
 void H5ImageSource::read_frame_hyperslab(Located at, FrameView dst) {
-  if (at.local >= at.source.num_frames) {
+  if (at.local >= at.source.num_frames.load() && options_.swmr) {
+    refresh(at.source);
+  }
+  if (at.local >= at.source.num_frames.load()) {
     throw std::runtime_error(
         fmt::format("frame {} of {} is not written", at.local, at.source.file));
   }
