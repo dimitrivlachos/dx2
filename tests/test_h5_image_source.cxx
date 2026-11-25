@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <dx2/h5/h5utils.hpp>
@@ -349,4 +350,364 @@ TEST(H5ImageSourceTest, MissingFileOrDatasetThrowsWithTheName) {
   }
   EXPECT_THROW(H5ImageSource(scratch_dir() / "absent.h5"), std::runtime_error)
       << "A missing file did not throw";
+}
+
+// ---------------------------------------------------------------------
+// Layouts: virtual datasets, "." sources, numbered external links.
+// ---------------------------------------------------------------------
+
+namespace {
+
+using Pixel = uint16_t;
+
+/// Creates a {frames, SLOW, fast} uint16 dataset chunked one per frame.
+h5utils::H5Dataset create_frames(hid_t group, const std::string &name,
+                                 size_t frames, Compression compression,
+                                 size_t fast = FAST) {
+  const hsize_t dims[3] = {frames, SLOW, fast};
+  const hsize_t chunk[3] = {1, SLOW, fast};
+  h5utils::H5Plist dcpl(H5Pcreate(H5P_DATASET_CREATE));
+  H5Pset_chunk(dcpl, 3, chunk);
+  if (compression == Compression::BitshuffleLZ4) {
+    const unsigned user_values[2] = {0, 2};
+    H5Pset_filter(dcpl, dx2::bitshuffle_filter_id, H5Z_FLAG_OPTIONAL, 2,
+                  user_values);
+  }
+  h5utils::H5Space space(H5Screate_simple(3, dims, nullptr));
+  h5utils::H5Type type = h5dispatch::H5TypeTraits<Pixel>::make();
+  return h5utils::H5Dataset(H5Dcreate2(group, name.c_str(), type, space,
+                                       H5P_DEFAULT, dcpl, H5P_DEFAULT));
+}
+
+/// Stores expected_pixels(pattern) as chunk `local` of a dataset.
+void write_frame(hid_t dataset, size_t local, size_t pattern,
+                 Compression compression) {
+  const auto pixels = expected_pixels<Pixel>(pattern);
+  const hsize_t offset[3] = {local, 0, 0};
+  const auto chunk = dx2::encode_chunk(std::as_bytes(std::span(pixels)),
+                                       compression, sizeof(Pixel));
+  H5Dwrite_chunk(dataset, H5P_DEFAULT, 0, offset, chunk.size(), chunk.data());
+}
+
+/// Writes a data file whose /entry/data/data holds `patterns.size()`
+/// frames, frame i showing expected_pixels(patterns[i]).
+std::filesystem::path write_data_file(const std::filesystem::path &path,
+                                      const std::vector<size_t> &patterns,
+                                      Compression compression) {
+  std::filesystem::create_directories(path.parent_path());
+  h5utils::H5File file(
+      H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Group entry(
+      H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Group data(
+      H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Dataset dataset =
+      create_frames(data, "data", patterns.size(), compression);
+  for (size_t i = 0; i < patterns.size(); ++i) {
+    write_frame(dataset, i, patterns[i], compression);
+  }
+  return path;
+}
+
+/// One virtual mapping: `count` whole frames of `dataset` in `file`
+/// starting at source frame `source_first`, placed at virtual frame
+/// `virtual_first`. With `unlimited` the run is open-ended on both sides.
+struct Mapping {
+  std::string file;
+  std::string dataset;
+  hsize_t virtual_first;
+  hsize_t source_first;
+  hsize_t count;
+  bool unlimited = false;
+};
+
+/// Creates /entry/data/data in `file` as a virtual dataset of
+/// `virtual_frames` frames, SLOW by `fast`, from the mappings. The source
+/// selections use the same `fast` extent, so a value below FAST selects
+/// the left part of each source frame.
+void add_vds(hid_t file, const std::vector<Mapping> &mappings,
+             hsize_t virtual_frames, size_t fast = FAST) {
+  h5utils::H5Group entry;
+  {
+    h5utils::H5ErrorSilencer quiet;
+    entry = h5utils::H5Group(H5Gopen2(file, "entry", H5P_DEFAULT));
+  }
+  if (!entry) {
+    entry = h5utils::H5Group(
+        H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  }
+  h5utils::H5Group data;
+  {
+    h5utils::H5ErrorSilencer quiet;
+    data = h5utils::H5Group(H5Gopen2(entry, "data", H5P_DEFAULT));
+  }
+  if (!data) {
+    data = h5utils::H5Group(
+        H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  }
+
+  const bool unlimited =
+      std::any_of(mappings.begin(), mappings.end(),
+                  [](const Mapping &m) { return m.unlimited; });
+  const hsize_t vdims[3] = {unlimited ? 0 : virtual_frames, SLOW, fast};
+  const hsize_t vmax[3] = {unlimited ? H5S_UNLIMITED : virtual_frames, SLOW,
+                           fast};
+  h5utils::H5Space vspace(H5Screate_simple(3, vdims, vmax));
+  h5utils::H5Plist dcpl(H5Pcreate(H5P_DATASET_CREATE));
+  for (const Mapping &m : mappings) {
+    const hsize_t stride[3] = {1, 1, 1};
+    const hsize_t count[3] = {m.unlimited ? H5S_UNLIMITED : m.count, 1, 1};
+    const hsize_t block[3] = {m.unlimited ? 1 : 1, SLOW, fast};
+    // Virtual side: count frames of one block each at virtual_first.
+    const hsize_t vstart[3] = {m.virtual_first, 0, 0};
+    H5Sselect_hyperslab(vspace, H5S_SELECT_SET, vstart, stride, count, block);
+    // Source side: the same run at source_first in a source space whose
+    // frame extent is open, so the mapping does not fix the source size.
+    const hsize_t sdims[3] = {0, SLOW, fast};
+    const hsize_t smax[3] = {H5S_UNLIMITED, SLOW, fast};
+    h5utils::H5Space sspace(H5Screate_simple(3, sdims, smax));
+    const hsize_t sstart[3] = {m.source_first, 0, 0};
+    H5Sselect_hyperslab(sspace, H5S_SELECT_SET, sstart, stride, count, block);
+    ASSERT_GE(
+        H5Pset_virtual(dcpl, vspace, m.file.c_str(), m.dataset.c_str(), sspace),
+        0)
+        << "H5Pset_virtual failed for " << m.file << ":" << m.dataset;
+  }
+  h5utils::H5Type type = h5dispatch::H5TypeTraits<Pixel>::make();
+  h5utils::H5Dataset vds(
+      H5Dcreate2(data, "data", type, vspace, H5P_DEFAULT, dcpl, H5P_DEFAULT));
+  ASSERT_TRUE(vds) << "could not create the virtual dataset";
+}
+
+h5utils::H5File create_master(const std::filesystem::path &path) {
+  return h5utils::H5File(
+      H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT));
+}
+
+/// Reads every frame and compares it with its pattern.
+void expect_frames(H5ImageSource &source, const std::vector<size_t> &patterns,
+                   const char *what) {
+  ASSERT_EQ(source.num_frames(), patterns.size())
+      << what << ": frame count differs";
+  for (size_t v = 0; v < patterns.size(); ++v) {
+    const Frame frame = source.read_frame(v);
+    EXPECT_EQ(to_vector(as_pixels<Pixel>(frame)),
+              expected_pixels<Pixel>(patterns[v]))
+        << what << ": frame " << v << " differs";
+  }
+}
+
+} // namespace
+
+// A virtual dataset over two files, the second mapped from a nonzero
+// source offset, flattens to two sources and reads through the raw path.
+TEST(H5ImageLayoutTest, VirtualDatasetOverTwoFilesReadsEveryFrame) {
+  const auto dir = scratch_dir() / "vds_two";
+  write_data_file(dir / "data_a.h5", {0, 1, 2}, Compression::BitshuffleLZ4);
+  write_data_file(dir / "data_b.h5", {100, 101, 102, 103, 3, 4, 5},
+                  Compression::BitshuffleLZ4);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    // Relative names, found through the master's directory.
+    add_vds(file,
+            {{"data_a.h5", "/entry/data/data", 0, 0, 3},
+             {"data_b.h5", "/entry/data/data", 3, 4, 3}},
+            6);
+  }
+  H5ImageSource source(master);
+  const auto sources = source.sources();
+  ASSERT_EQ(sources.size(), 2u) << "expected two sources";
+  EXPECT_EQ(sources[0].file, dir / "data_a.h5") << "first source differs";
+  EXPECT_EQ(sources[1].num_frames, 7u) << "second source extent differs";
+  EXPECT_TRUE(source.supports_raw_chunks()) << "raw path should be offered";
+  EXPECT_EQ(source.compression(), Compression::BitshuffleLZ4)
+      << "compression differs";
+  expect_frames(source, {0, 1, 2, 3, 4, 5}, "two-file VDS");
+
+  // The raw chunk of a frame in the second file decodes to that frame
+  // and reports the virtual index.
+  std::vector<std::byte> buffer(source.max_raw_chunk_bytes());
+  const RawChunk raw = source.read_raw_chunk(4, buffer);
+  EXPECT_EQ(raw.info.frame, 4u) << "raw chunk reports the source index";
+  ChunkDecoder decoder(source.filters(), source.pixel_type(), SLOW * FAST);
+  std::vector<Pixel> pixels(SLOW * FAST);
+  decoder.decode(raw.bytes, raw.info.filter_mask,
+                 std::as_writable_bytes(std::span(pixels)));
+  EXPECT_EQ(pixels, expected_pixels<Pixel>(4)) << "raw chunk 4 differs";
+}
+
+// A "." source is the master itself; its dataset name may be a local
+// dataset or an external link the legacy reader special-cased.
+TEST(H5ImageLayoutTest, DotSourcesResolveInsideTheMaster) {
+  const auto dir = scratch_dir() / "vds_dot";
+  const auto external =
+      write_data_file(dir / "data_000002.h5", {3, 4, 5}, Compression::None);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    h5utils::H5Group entry(
+        H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group data(
+        H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Dataset local =
+        create_frames(data, "local", 3, Compression::None);
+    for (size_t i = 0; i < 3; ++i) {
+      write_frame(local, i, i, Compression::None);
+    }
+    H5Lcreate_external(external.c_str(), "/entry/data/data", data,
+                       "data_000002", H5P_DEFAULT, H5P_DEFAULT);
+    add_vds(file,
+            {{".", "/entry/data/local", 0, 0, 3},
+             {".", "/entry/data/data_000002", 3, 0, 3}},
+            6);
+  }
+  H5ImageSource source(master);
+  const auto sources = source.sources();
+  ASSERT_EQ(sources.size(), 2u) << "expected two sources";
+  EXPECT_EQ(sources[0].file, master) << "local source is not the master";
+  EXPECT_EQ(sources[0].dataset, "/entry/data/local") << "local dataset name";
+  EXPECT_EQ(sources[1].file, external) << "external link was not followed";
+  expect_frames(source, {0, 1, 2, 3, 4, 5}, "dot VDS");
+}
+
+// A mapping with an unlimited frame count takes every frame the source
+// holds at open.
+TEST(H5ImageLayoutTest, UnlimitedMappingTakesTheSourceExtent) {
+  const auto dir = scratch_dir() / "vds_unlimited";
+  write_data_file(dir / "data.h5", {0, 1, 2, 3}, Compression::BitshuffleLZ4);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    add_vds(file, {{"data.h5", "/entry/data/data", 0, 0, 0, true}}, 0);
+  }
+  H5ImageSource source(master);
+  expect_frames(source, {0, 1, 2, 3}, "unlimited VDS");
+}
+
+// Without /entry/data/data the numbered siblings are concatenated in name
+// order, with relative file names found only through the prefix option.
+TEST(H5ImageLayoutTest, NumberedExternalLinksConcatenateInNameOrder) {
+  const auto dir = scratch_dir() / "numbered";
+  write_data_file(dir / "files" / "data_000001.h5", {0, 1, 2},
+                  Compression::BitshuffleLZ4);
+  write_data_file(dir / "files" / "data_000002.h5", {3, 4, 5},
+                  Compression::BitshuffleLZ4);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    h5utils::H5Group entry(
+        H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group data(
+        H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    // Created out of order so that name order, not creation order, wins.
+    H5Lcreate_external("data_000002.h5", "/entry/data/data", data,
+                       "data_000002", H5P_DEFAULT, H5P_DEFAULT);
+    H5Lcreate_external("data_000001.h5", "/entry/data/data", data,
+                       "data_000001", H5P_DEFAULT, H5P_DEFAULT);
+    // A sibling that does not match the pattern is ignored.
+    H5Lcreate_external("unrelated.h5", "/x", data, "mask", H5P_DEFAULT,
+                       H5P_DEFAULT);
+  }
+  H5ImageSource::Options options;
+  options.vds_prefix = dir / "files";
+  H5ImageSource source(master, options);
+  const auto sources = source.sources();
+  ASSERT_EQ(sources.size(), 2u) << "expected two numbered sources";
+  EXPECT_EQ(sources[0].file, dir / "files" / "data_000001.h5")
+      << "name order not respected";
+  EXPECT_TRUE(source.supports_raw_chunks()) << "raw path should be offered";
+  expect_frames(source, {0, 1, 2, 3, 4, 5}, "numbered datasets");
+
+  // Without the prefix the files are not beside the master, and the
+  // error names where the first was looked for.
+  try {
+    H5ImageSource unresolved(master);
+    FAIL() << "opened with unresolvable relative links";
+  } catch (const std::runtime_error &e) {
+    EXPECT_NE(std::string(e.what()).find("data_000001.h5"), std::string::npos)
+        << "error does not name the missing file: " << e.what();
+  }
+}
+
+// A mapping that takes part of each frame cannot be flattened; the
+// virtual dataset is read through HDF5 instead, with no raw path.
+TEST(H5ImageLayoutTest, SubFrameMappingFallsBackToReadingTheVds) {
+  const auto dir = scratch_dir() / "vds_half";
+  write_data_file(dir / "data.h5", {0, 1, 2}, Compression::None);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    add_vds(file, {{"data.h5", "/entry/data/data", 0, 0, 3}}, 3, FAST / 2);
+  }
+  H5ImageSource source(master);
+  EXPECT_FALSE(source.supports_raw_chunks())
+      << "a sub-frame VDS has no raw path";
+  ASSERT_EQ(source.sources().size(), 1u) << "the VDS itself is the one source";
+  EXPECT_EQ(source.sources()[0].file, master) << "source is not the VDS";
+  EXPECT_EQ(source.shape(), (FrameShape{SLOW, FAST / 2})) << "shape differs";
+  const Frame frame = source.read_frame(1);
+  const auto full = expected_pixels<Pixel>(1);
+  const auto half = as_pixels<Pixel>(frame);
+  for (size_t row = 0; row < SLOW; ++row) {
+    for (size_t col = 0; col < FAST / 2; ++col) {
+      ASSERT_EQ(half[row * (FAST / 2) + col], full[row * FAST + col])
+          << "pixel (" << row << ", " << col << ") differs";
+    }
+  }
+}
+
+// An external link to a file that is not there is an error naming the
+// file looked for, not a quiet empty source.
+TEST(H5ImageLayoutTest, MissingExternalFileIsNamedInTheError) {
+  const auto dir = scratch_dir() / "missing";
+  std::filesystem::create_directories(dir);
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    h5utils::H5Group entry(
+        H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group data(
+        H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    H5Lcreate_external("nowhere.h5", "/entry/data/data", data, "data",
+                       H5P_DEFAULT, H5P_DEFAULT);
+  }
+  try {
+    H5ImageSource source(master);
+    FAIL() << "opened through a dangling external link";
+  } catch (const std::runtime_error &e) {
+    EXPECT_NE(std::string(e.what()).find("nowhere.h5"), std::string::npos)
+        << "error does not name the missing file: " << e.what();
+  }
+}
+
+// Sources must agree on shape; a mismatched one is refused by name.
+TEST(H5ImageLayoutTest, SourcesWithDifferentShapesAreRefused) {
+  const auto dir = scratch_dir() / "vds_mismatch";
+  write_data_file(dir / "data_a.h5", {0, 1}, Compression::None);
+  {
+    h5utils::H5File file(H5Fcreate((dir / "data_b.h5").c_str(), H5F_ACC_TRUNC,
+                                   H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group entry(
+        H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group data(
+        H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    create_frames(data, "data", 2, Compression::None, FAST / 2);
+  }
+  const auto master = dir / "master.h5";
+  {
+    h5utils::H5File file = create_master(master);
+    h5utils::H5Group entry(
+        H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    h5utils::H5Group data(
+        H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    H5Lcreate_external("data_000001.h5", "/entry/data/data", data,
+                       "data_000001", H5P_DEFAULT, H5P_DEFAULT);
+    H5Lcreate_external("data_000002.h5", "/entry/data/data", data,
+                       "data_000002", H5P_DEFAULT, H5P_DEFAULT);
+  }
+  std::filesystem::rename(dir / "data_a.h5", dir / "data_000001.h5");
+  std::filesystem::rename(dir / "data_b.h5", dir / "data_000002.h5");
+  EXPECT_THROW(H5ImageSource source(master), std::runtime_error)
+      << "sources of different shape were accepted";
 }
