@@ -1,11 +1,16 @@
 #include "dx2/image/h5_image_source.hpp"
 #include "dx2/h5/h5link.hpp"
 #include "dx2/h5/h5read.hpp"
+#include <H5FDsec2.h>
 #include <algorithm>
+#include <cerrno>
+#include <fcntl.h>
 #include <fmt/format.h>
 #include <fmt/std.h>
 #include <regex>
 #include <stdexcept>
+#include <system_error>
+#include <unistd.h>
 #include <vector>
 
 namespace dx2 {
@@ -375,6 +380,36 @@ void H5ImageSource::open_dataset(Source &source) {
   if (source.one_chunk_per_frame &&
       ChunkDecoder::can_decode(source.filters, type)) {
     source.decoder.emplace(source.filters, type, dims[1] * dims[2]);
+    if (options_.direct_io) {
+      open_direct(source);
+    }
+  }
+}
+
+void H5ImageSource::open_direct(Source &source) {
+  // Only the sec2 driver stores the file as one plain byte stream whose
+  // offsets are the addresses HDF5 reports.
+  H5Plist fapl(H5Fget_access_plist(source.file_handle));
+  if (!fapl || H5Pget_driver(fapl) != H5FD_SEC2) {
+    return;
+  }
+#if !H5_VERSION_GE(1, 14, 4)
+  H5Plist fcpl(H5Fget_create_plist(source.file_handle));
+  hsize_t user_block = 0;
+  H5Pget_userblock(fcpl, &user_block);
+  source.address_offset = user_block;
+#endif
+  source.fd = ::open(source.file.c_str(), O_RDONLY | O_CLOEXEC);
+  if (source.fd < 0) {
+    throw std::system_error(
+        errno, std::generic_category(),
+        fmt::format("cannot open {} for reading", source.file));
+  }
+}
+
+H5ImageSource::Source::~Source() {
+  if (fd >= 0) {
+    ::close(fd);
   }
 }
 
@@ -468,7 +503,7 @@ std::vector<H5ImageSource::SourceInfo> H5ImageSource::sources() const {
   info.reserve(sources_.size());
   for (const std::unique_ptr<Source> &source : sources_) {
     info.push_back({source->file, source->dataset, source->num_frames.load(),
-                    source->open.load()});
+                    source->open.load(), source->fd >= 0});
   }
   return info;
 }
@@ -578,16 +613,37 @@ RawChunk H5ImageSource::read_raw_chunk(size_t frame, std::span<std::byte> dst) {
                     info->stored_bytes, dst.size()));
   }
   const Located at = locate_open(frame);
-  const hsize_t offset[3] = {at.local, 0, 0};
-  uint32_t filter_mask = 0;
-  if (H5Dread_chunk(at.source.dataset_handle, H5P_DEFAULT, offset, &filter_mask,
-                    dst.data()) < 0) {
-    throw std::runtime_error(fmt::format("cannot read chunk {} of {} in {}",
-                                         at.local, at.source.dataset,
-                                         at.source.file));
+  if (at.source.fd >= 0) {
+    // pread is positional, so threads share the descriptor without a seek
+    // or a lock; it may return short and is called until the chunk is in.
+    size_t done = 0;
+    while (done < info->stored_bytes) {
+      const ssize_t got = ::pread(
+          at.source.fd, dst.data() + done, info->stored_bytes - done,
+          static_cast<off_t>(info->address + at.source.address_offset + done));
+      if (got < 0 && errno == EINTR) {
+        continue;
+      }
+      if (got <= 0) {
+        throw std::runtime_error(fmt::format(
+            "cannot read chunk {} of {} in {} at offset {}: {}", at.local,
+            at.source.dataset, at.source.file, info->address,
+            got < 0 ? std::generic_category().message(errno) : "end of file"));
+      }
+      done += static_cast<size_t>(got);
+    }
+  } else {
+    const hsize_t offset[3] = {at.local, 0, 0};
+    uint32_t filter_mask = 0;
+    if (H5Dread_chunk(at.source.dataset_handle, H5P_DEFAULT, offset,
+                      &filter_mask, dst.data()) < 0) {
+      throw std::runtime_error(fmt::format("cannot read chunk {} of {} in {}",
+                                           at.local, at.source.dataset,
+                                           at.source.file));
+    }
   }
   return RawChunk{dst.first(info->stored_bytes), *info,
-                  at.source.decoder->header_bytes(filter_mask)};
+                  at.source.decoder->header_bytes(info->filter_mask)};
 }
 
 void H5ImageSource::read_frame_into(size_t frame, FrameView dst) {

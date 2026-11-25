@@ -17,14 +17,24 @@
  * used.
  *
  * A source chunked with one chunk per frame, {1, slow, fast}, offers each
- * frame as its stored chunk through H5Dread_chunk, bypassing HDF5's filter
- * pipeline, with dx2's own ChunkDecoder to decode or the caller doing so.
- * Raw chunks are offered only when every source qualifies and shares one
- * filter pipeline summary. Anything else is read frame by frame with a
- * hyperslab H5Dread and HDF5's own filters, which needs the filter plugin
- * to be loadable. A virtual dataset whose mappings are not whole frames
- * from a three-dimensional source, such as a sub-frame slab or a printf
- * pattern, is read through HDF5 as a single source with no raw path.
+ * frame as its stored chunk, bypassing HDF5's filter pipeline, with dx2's
+ * own ChunkDecoder to decode or the caller doing so. Raw chunks are
+ * offered only when every source qualifies and shares one filter pipeline
+ * summary. The chunk bytes are fetched with pread on a descriptor dx2
+ * opens itself, after one HDF5 call for the chunk's address and size, so
+ * the library and its global lock are held for a metadata lookup rather
+ * than the transfer. That needs the address to be a plain file offset,
+ * which holds for the default sec2 driver; HDF5 1.14.4 and later include
+ * the user block in the address, earlier versions have it added here. A
+ * source on another driver, or with direct_io off, is read through
+ * H5Dread_chunk instead and the result is the same bytes. Under SWMR the
+ * writer flushes a chunk before the index entry that points at it and
+ * does not reuse freed space while the file is open, so an address a
+ * refreshed index reports is safe to read without the library. Anything else is
+ * read frame by frame with a hyperslab H5Dread and HDF5's own filters, which
+ * needs the filter plugin to be loadable. A virtual dataset whose mappings are
+ * not whole frames from a three-dimensional source, such as a sub-frame slab or
+ * a printf pattern, is read through HDF5 as a single source with no raw path.
  *
  * Source files named relative to the master are found the way HDF5 finds
  * them, so the raw path and the fallback agree: the HDF5_VDS_PREFIX or
@@ -84,6 +94,8 @@ public:
     bool swmr = false;
     /// Shortest gap between two H5Drefresh calls on one source.
     std::chrono::milliseconds refresh_min_interval{20};
+    /// Fetch raw chunks with pread where the file's driver allows it.
+    bool direct_io = true;
     /// Directory tried for relative source file names after the
     /// environment variables and before the master's directory.
     std::optional<std::filesystem::path> vds_prefix;
@@ -97,6 +109,8 @@ public:
     /// file is still awaited.
     size_t num_frames;
     bool open;
+    /// Raw chunks of this source are fetched with pread.
+    bool direct_io;
   };
 
   /**
@@ -143,6 +157,11 @@ private:
     FilterPipeline filters;
     std::optional<ChunkDecoder> decoder;
     std::chrono::steady_clock::time_point last_refresh{};
+    /// Descriptor for pread, or -1 when chunks go through HDF5.
+    int fd = -1;
+    /// Bytes to add to a chunk address to reach its file offset.
+    uint64_t address_offset = 0;
+    ~Source();
   };
   /// A run of virtual frames starting at `first`, stored from frame
   /// `source_first` of sources_[source]. A fixed run holds `count`
@@ -167,6 +186,7 @@ private:
   size_t add_source(const std::filesystem::path &file,
                     const std::string &dataset, bool file_exists);
   void open_dataset(Source &source);
+  void open_direct(Source &source);
   void check_matches_reference(const Source &source) const;
   bool ensure_open(Source &source);
   void refresh(Source &source);

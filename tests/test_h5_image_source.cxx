@@ -899,3 +899,77 @@ TEST(H5ImageSwmrTest, LateSourceWithADifferentShapeIsRefusedWhenItAppears) {
   EXPECT_THROW(source.chunk_info(1), std::runtime_error)
       << "a late source of another shape must be refused";
 }
+
+namespace {
+
+/// Writes a data file like write_data_file but with a user block of
+/// `user_block` bytes in front of the HDF5 content.
+std::filesystem::path
+write_data_file_with_user_block(const std::filesystem::path &path,
+                                const std::vector<size_t> &patterns,
+                                hsize_t user_block) {
+  std::filesystem::create_directories(path.parent_path());
+  h5utils::H5Plist fcpl(H5Pcreate(H5P_FILE_CREATE));
+  H5Pset_userblock(fcpl, user_block);
+  h5utils::H5File file(
+      H5Fcreate(path.c_str(), H5F_ACC_TRUNC, fcpl, H5P_DEFAULT));
+  h5utils::H5Group entry(
+      H5Gcreate2(file, "entry", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Group data(
+      H5Gcreate2(entry, "data", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  h5utils::H5Dataset dataset =
+      create_frames(data, "data", patterns.size(), Compression::BitshuffleLZ4);
+  for (size_t i = 0; i < patterns.size(); ++i) {
+    write_frame(dataset, i, patterns[i], Compression::BitshuffleLZ4);
+  }
+  return path;
+}
+
+/// The raw chunk of every frame, read with the given direct_io setting.
+std::vector<std::vector<std::byte>>
+raw_chunks(const std::filesystem::path &path, bool direct_io) {
+  H5ImageSource::Options options;
+  options.direct_io = direct_io;
+  H5ImageSource source(path, options);
+  EXPECT_EQ(source.sources().front().direct_io, direct_io)
+      << "the source did not take the requested chunk path";
+  std::vector<std::vector<std::byte>> chunks;
+  std::vector<std::byte> buffer(source.max_raw_chunk_bytes());
+  for (size_t f = 0; f < source.num_frames(); ++f) {
+    const RawChunk raw = source.read_raw_chunk(f, buffer);
+    chunks.emplace_back(raw.bytes.begin(), raw.bytes.end());
+  }
+  return chunks;
+}
+
+} // namespace
+
+// A 512 byte user block shifts every chunk in the file. The pread path
+// must land on the same bytes H5Dread_chunk returns, and decode to the
+// written frames, or the address is being used without the block.
+TEST(H5ImageDirectIoTest, PreadMatchesHdfReadChunkAcrossAUserBlock) {
+  const auto path = scratch_dir() / "direct_io" / "user_block.h5";
+  write_data_file_with_user_block(path, {0, 1, 2}, 512);
+  const auto through_hdf5 = raw_chunks(path, false);
+  const auto through_pread = raw_chunks(path, true);
+  ASSERT_EQ(through_pread.size(), 3u) << "frame count differs";
+  for (size_t f = 0; f < through_pread.size(); ++f) {
+    EXPECT_EQ(through_pread[f], through_hdf5[f])
+        << "chunk " << f << " differs between pread and H5Dread_chunk";
+  }
+  H5ImageSource source(path);
+  expect_frames(source, {0, 1, 2}, "decoded through the pread path");
+}
+
+// A contiguous dataset has no chunks to pread, so the source reports no
+// direct path and still reads through the hyperslab fallback.
+TEST(H5ImageDirectIoTest, SourceWithoutChunksReportsNoDirectPath) {
+  const auto fixture = write_fixture<uint16_t>(
+      "direct_io_contiguous", Compression::None, NUM_FRAMES, false);
+  H5ImageSource source(fixture.path);
+  EXPECT_FALSE(source.sources().front().direct_io)
+      << "a contiguous dataset cannot offer pread";
+  EXPECT_EQ(to_vector(as_pixels<uint16_t>(source.read_frame(1))),
+            expected_pixels<uint16_t>(1))
+      << "frame 1 differs";
+}
