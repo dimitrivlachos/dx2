@@ -46,6 +46,9 @@ target_link_libraries(test_chunk_decoder GTest::gtest_main dx2 hdf5::hdf5)
 add_executable(test_h5_image_source test_h5_image_source.cxx)
 target_link_libraries(test_h5_image_source GTest::gtest_main dx2 hdf5::hdf5)
 
+add_executable(test_frame_prefetcher test_frame_prefetcher.cxx)
+target_link_libraries(test_frame_prefetcher GTest::gtest_main dx2 hdf5::hdf5)
+
 add_executable(test_h5link test_h5link.cxx)
 target_link_libraries(test_h5link GTest::gtest_main dx2 hdf5::hdf5)
 
@@ -70,6 +73,7 @@ set(DX2_TESTS
     test_frame
     test_chunk_decoder
     test_h5_image_source
+    test_frame_prefetcher
     test_h5link
     test_experiment
     test_experiment_list
@@ -83,6 +87,7 @@ set(DX2_HDF5_FILE_TESTS
     test_read_h5_array
     test_reflection_table
     test_h5_image_source
+    test_frame_prefetcher
     test_h5link
 )
 

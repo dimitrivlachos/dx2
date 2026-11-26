@@ -167,6 +167,12 @@ public:
       : type_(type), shape_(shape),
         size_(shape[0] * shape[1] * pixel_size(type)),
         storage_(std::make_unique_for_overwrite<std::byte[]>(size_)) {}
+  /// Adopts storage of at least the frame's size, so a buffer can be
+  /// reused across frames without being zeroed or faulted in again.
+  Frame(std::unique_ptr<std::byte[]> storage, PixelType type, FrameShape shape)
+      : type_(type), shape_(shape),
+        size_(shape[0] * shape[1] * pixel_size(type)),
+        storage_(std::move(storage)) {}
 
   PixelType type() const { return type_; }
   FrameShape shape() const { return shape_; }
@@ -177,6 +183,13 @@ public:
 
   FrameView view() { return FrameView(bytes(), type_, shape_); }
   ConstFrameView view() const { return ConstFrameView(bytes(), type_, shape_); }
+
+  /// Gives up the storage, leaving an empty frame.
+  std::unique_ptr<std::byte[]> release() {
+    size_ = 0;
+    shape_ = {};
+    return std::move(storage_);
+  }
 
 private:
   PixelType type_{};
